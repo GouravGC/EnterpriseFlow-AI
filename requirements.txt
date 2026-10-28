@@ -1,0 +1,51 @@
+
+# EnterpriseFlow AI
+# Python 3.11.10
+# Direct dependencies pinned to exact versions
+
+# API and configuration
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.3
+pydantic-settings==2.8.1
+python-dotenv==1.1.0
+python-multipart==0.0.20
+httpx==0.28.1
+
+# OpenRouter / LLM
+openai==1.76.0
+tenacity==9.1.2
+
+# RAG and document processing
+langchain==0.3.23
+langchain-core==0.3.53
+langchain-openai==0.3.14
+langchain-community==0.3.21
+langchain-text-splitters==0.3.8
+chromadb==0.6.3
+pypdf==5.4.0
+
+# Tracing
+langsmith==0.3.33
+
+# Database
+sqlalchemy==2.0.40
+alembic==1.15.2
+psycopg[binary]==3.2.6
+
+# Cache and background processing
+redis==5.2.1
+celery[redis]==5.4.0
+
+# Google Cloud
+google-cloud-aiplatform==1.90.0
+google-cloud-storage==2.19.0
+google-cloud-secret-manager==2.22.1
+google-cloud-logging==3.11.4
+
+# Frontend
+streamlit==1.44.1
+
+# Testing and linting
+pytest==8.3.5
+ruff==0.11.5
