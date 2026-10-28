@@ -1,8 +1,10 @@
 
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from redis.asyncio import Redis
 
 from ai_service import AIService, AIServiceError
 from config import settings
@@ -19,12 +21,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+CACHE_VERSION_KEY = "enterpriseflow:knowledge_base_version"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.ai_service = None
     app.state.rag_service = RAGService()
+    app.state.redis = None
 
     if settings.openrouter_api_key and settings.openrouter_model:
         try:
@@ -33,9 +37,45 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to initialize AI service.")
 
+    # Redis is optional. The API continues without it.
+    if settings.cache_enabled and settings.redis_url:
+        redis_client = None
+
+        try:
+            redis_client = Redis.from_url(
+                settings.redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+
+            await redis_client.ping()
+            app.state.redis = redis_client
+            logger.info("Redis cache connected.")
+
+        except Exception:
+            logger.warning(
+                "Redis unavailable. Running without caching.",
+                exc_info=True,
+            )
+
+            if redis_client:
+                try:
+                    await redis_client.aclose()
+                except Exception:
+                    logger.warning("Redis cleanup failed.")
+
     logger.info("EnterpriseFlow AI startup complete.")
 
     yield
+
+    if app.state.redis:
+        try:
+            await app.state.redis.aclose()
+            logger.info("Redis connection closed.")
+        except Exception:
+            logger.warning("Redis shutdown failed.")
 
     logger.info("EnterpriseFlow AI shutting down.")
 
@@ -45,7 +85,7 @@ app = FastAPI(
     version=settings.app_version,
     description=(
         "Enterprise operations copilot with document retrieval, "
-        "Hugging Face hosted embeddings, and OpenRouter inference."
+        "OpenRouter embeddings, and LLM inference."
     ),
     lifespan=lifespan,
 )
@@ -74,14 +114,18 @@ async def health():
 async def document_status():
     try:
         count = app.state.rag_service.chunk_count()
+
         return {
             "status": "ready",
             "indexed_chunks": count,
-            "embedding_provider": "Hugging Face Inference API",
-            "embedding_model": settings.hf_embedding_model,
+            "embedding_provider": "OpenRouter",
+            "embedding_model": settings.openrouter_embedding_model,
+            "vector_database": "ChromaDB",
         }
+
     except Exception as exc:
         logger.exception("Failed to retrieve document index status.")
+
         raise HTTPException(
             status_code=500,
             detail="Unable to retrieve document index status.",
@@ -92,9 +136,7 @@ async def document_status():
     "/documents",
     response_model=DocumentUploadResponse,
 )
-async def upload_document(
-    file: UploadFile = File(...),
-):
+async def upload_document(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(
             status_code=400,
@@ -123,6 +165,19 @@ async def upload_document(
 
         total_chunks = app.state.rag_service.chunk_count()
 
+        # Version-based invalidation: old answer keys become unreachable.
+        redis_client = getattr(app.state, "redis", None)
+
+        if redis_client:
+            try:
+                await redis_client.incr(CACHE_VERSION_KEY)
+                logger.info("Knowledge-base cache version updated.")
+            except Exception:
+                logger.warning(
+                    "Cache version update failed.",
+                    exc_info=True,
+                )
+
         logger.info(
             "Indexed file '%s': %s new chunks.",
             file.filename,
@@ -142,6 +197,7 @@ async def upload_document(
             file.filename,
             exc,
         )
+
         raise HTTPException(
             status_code=400,
             detail=str(exc),
@@ -152,6 +208,7 @@ async def upload_document(
             "Document indexing failed for file: %s",
             file.filename,
         )
+
         raise HTTPException(
             status_code=500,
             detail=(
@@ -178,6 +235,7 @@ async def ask_question(request: AskRequest):
         )
 
     try:
+        # Retrieve relevant document chunks.
         retrieved = app.state.rag_service.retrieve(
             question=request.question,
             top_k=4,
@@ -211,19 +269,84 @@ async def ask_question(request: AskRequest):
 
         context = "\n\n".join(context_parts)
 
+        redis_client = getattr(app.state, "redis", None)
+
+        # Include knowledge-base version in the cache key.
+        knowledge_version = "0"
+
+        if redis_client:
+            try:
+                knowledge_version = (
+                    await redis_client.get(CACHE_VERSION_KEY) or "0"
+                )
+            except Exception:
+                logger.warning("Redis version lookup failed.")
+
+        normalized_question = request.question.strip().casefold()
+
+        cache_material = (
+            f"{knowledge_version}\0"
+            f"{normalized_question}\0"
+            f"{context}"
+        )
+
+        cache_key = (
+            "enterpriseflow:answer:"
+            + hashlib.sha256(
+                cache_material.encode("utf-8")
+            ).hexdigest()
+        )
+
+        # Try cache before calling the LLM.
+        if redis_client:
+            try:
+                cached = await redis_client.get(cache_key)
+
+                if cached:
+                    logger.info("Answer cache hit.")
+
+                    return AskResponse.model_validate_json(cached)
+
+            except Exception:
+                logger.warning(
+                    "Redis read failed. Bypassing cache.",
+                    exc_info=True,
+                )
+
+        # Generate answer through OpenRouter.
         answer = await ai_service.answer(
             question=request.question,
             context=context,
         )
 
-        return AskResponse(
+        result = AskResponse(
             answer=answer,
             status="success",
             sources=sources,
         )
 
+        # Cache successful responses.
+        if redis_client:
+            try:
+                await redis_client.setex(
+                    cache_key,
+                    settings.cache_ttl_seconds,
+                    result.model_dump_json(),
+                )
+
+                logger.info("Answer cached successfully.")
+
+            except Exception:
+                logger.warning(
+                    "Redis write failed. Returning uncached answer.",
+                    exc_info=True,
+                )
+
+        return result
+
     except AIServiceError as exc:
         logger.exception("OpenRouter answer generation failed.")
+
         raise HTTPException(
             status_code=502,
             detail="The AI provider could not generate an answer.",
@@ -231,10 +354,11 @@ async def ask_question(request: AskRequest):
 
     except Exception as exc:
         logger.exception("Question-answering request failed.")
+
         raise HTTPException(
             status_code=500,
             detail=(
                 "Question answering failed. "
-                "Check the API terminal logs."
+                "Check API logs."
             ),
         ) from exc
