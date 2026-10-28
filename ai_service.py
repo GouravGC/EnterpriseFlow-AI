@@ -1,6 +1,7 @@
-import asyncio
 
-from openai import AsyncOpenAI, APIError, APITimeoutError
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from config import settings
 
 
@@ -9,46 +10,85 @@ class AIServiceError(Exception):
 
 
 class AIService:
-    def __init__(self) -> None:
-        if not settings.openrouter_api_key or not settings.openrouter_model:
-            raise AIServiceError("OpenRouter configuration is missing.")
+    """EnterpriseFlow AI service using OpenRouter-hosted LLMs."""
 
-        self.client = AsyncOpenAI(
+    def __init__(self) -> None:
+        if not settings.openrouter_api_key:
+            raise AIServiceError(
+                "OPENROUTER_API_KEY is not configured."
+            )
+
+        if not settings.openrouter_model:
+            raise AIServiceError(
+                "OPENROUTER_MODEL is not configured."
+            )
+
+        self.llm = ChatOpenAI(
+            model=settings.openrouter_model,
             api_key=settings.openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
             timeout=30.0,
-            max_retries=1,
+            max_retries=0,
+            max_tokens=500,
         )
-        self.model = settings.openrouter_model
 
-    async def answer(self, question: str) -> str:
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are EnterpriseFlow AI, an enterprise "
-                            "operations assistant. Be accurate, concise, "
-                            "and explicitly state when information is uncertain."
-                        ),
-                    },
-                    {"role": "user", "content": question},
-                ],
-                max_tokens=500,
+    async def answer(
+        self,
+        question: str,
+        context: str = "",
+    ) -> str:
+        """Generate an answer, grounding it in retrieved context when available."""
+
+        if context.strip():
+            instructions = (
+                "You are EnterpriseFlow AI, an enterprise "
+                "operations copilot. Answer the user's question "
+                "using the retrieved document excerpts below. "
+                "Do not invent policies, facts, or citations. "
+                "If the excerpts do not contain the answer, "
+                "say that the available documents do not provide "
+                "enough information. Distinguish document facts "
+                "from any inference.\n\n"
+                "Retrieved excerpts:\n"
+                f"{context}"
+            )
+        else:
+            instructions = (
+                "You are EnterpriseFlow AI, an enterprise "
+                "operations copilot. No relevant uploaded "
+                "document excerpts were retrieved. You may "
+                "answer general questions, but clearly state "
+                "that the answer is not grounded in the uploaded "
+                "knowledge base. Never invent company policies."
             )
 
-            answer = response.choices[0].message.content
+        try:
+            response = await self.llm.ainvoke(
+                [
+                    SystemMessage(content=instructions),
+                    HumanMessage(content=question),
+                ]
+            )
+
+            answer = response.content
+
+            if not isinstance(answer, str):
+                answer = str(answer)
+
+            answer = answer.strip()
+
             if not answer:
-                raise AIServiceError("The AI provider returned an empty answer.")
+                raise AIServiceError(
+                    "The AI provider returned an empty answer."
+                )
 
-            return answer.strip()
+            return answer
 
-        except APITimeoutError as exc:
-            raise AIServiceError("The AI request timed out.") from exc
-        except APIError as exc:
-            raise AIServiceError("The AI provider request failed.") from exc
+        except AIServiceError:
+            raise
 
-    async def close(self) -> None:
-        await self.client.close()
+        except Exception as exc:
+            # Do not expose provider details in API responses.
+            raise AIServiceError(
+                "The AI provider request failed."
+            ) from exc

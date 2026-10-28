@@ -53,3 +53,11 @@ data/processed/
 
 # Streamlit secrets
 .streamlit/secrets.toml
+
+# Local vector database
+data/
+
+# Private source documents: do not commit company files
+knowledge_base/*
+!knowledge_base/README.md
+!knowledge_base/.gitkeep
