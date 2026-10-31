@@ -1,4 +1,3 @@
-
 FROM python:3.11.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -11,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY config.py main.py schemas.py ai_service.py ./
+COPY config.py main.py schemas.py ai_service.py guardrails.py ./
 COPY rag ./rag
 
 RUN useradd --create-home appuser \

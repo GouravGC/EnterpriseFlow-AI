@@ -1,0 +1,20 @@
+[
+  {
+    "id": "account-lockout-001",
+    "question": "What should an employee do if their account is locked after repeated failed login attempts?",
+    "expected_source": "it_support_sop.md",
+    "expected_keywords": [
+      "account",
+      "recovery"
+    ]
+  },
+  {
+    "id": "password-reset-001",
+    "question": "Where should an employee go for password reset help?",
+    "expected_source": "it_support_sop.md",
+    "expected_keywords": [
+      "password",
+      "support"
+    ]
+  }
+]

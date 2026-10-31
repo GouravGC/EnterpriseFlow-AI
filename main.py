@@ -1,4 +1,3 @@
-
 import hashlib
 import logging
 from contextlib import asynccontextmanager
@@ -8,6 +7,12 @@ from redis.asyncio import Redis
 
 from ai_service import AIService, AIServiceError
 from config import settings
+from guardrails import (
+    InputGuardrailError,
+    OutputGuardrailError,
+    validate_generated_answer,
+    validate_user_question,
+)
 from rag.service import RAGService
 from schemas import (
     AskRequest,
@@ -223,6 +228,14 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(request: AskRequest):
+    try:
+        safe_question = validate_user_question(request.question)
+    except InputGuardrailError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
     ai_service = app.state.ai_service
 
     if ai_service is None:
@@ -235,9 +248,8 @@ async def ask_question(request: AskRequest):
         )
 
     try:
-        # Retrieve relevant document chunks.
         retrieved = app.state.rag_service.retrieve(
-            question=request.question,
+            question=safe_question,
             top_k=4,
         )
 
@@ -271,7 +283,6 @@ async def ask_question(request: AskRequest):
 
         redis_client = getattr(app.state, "redis", None)
 
-        # Include knowledge-base version in the cache key.
         knowledge_version = "0"
 
         if redis_client:
@@ -282,7 +293,7 @@ async def ask_question(request: AskRequest):
             except Exception:
                 logger.warning("Redis version lookup failed.")
 
-        normalized_question = request.question.strip().casefold()
+        normalized_question = safe_question.casefold()
 
         cache_material = (
             f"{knowledge_version}\0"
@@ -297,14 +308,12 @@ async def ask_question(request: AskRequest):
             ).hexdigest()
         )
 
-        # Try cache before calling the LLM.
         if redis_client:
             try:
                 cached = await redis_client.get(cache_key)
 
                 if cached:
                     logger.info("Answer cache hit.")
-
                     return AskResponse.model_validate_json(cached)
 
             except Exception:
@@ -313,11 +322,12 @@ async def ask_question(request: AskRequest):
                     exc_info=True,
                 )
 
-        # Generate answer through OpenRouter.
         answer = await ai_service.answer(
-            question=request.question,
+            question=safe_question,
             context=context,
         )
+
+        answer = validate_generated_answer(answer)
 
         result = AskResponse(
             answer=answer,
@@ -325,7 +335,6 @@ async def ask_question(request: AskRequest):
             sources=sources,
         )
 
-        # Cache successful responses.
         if redis_client:
             try:
                 await redis_client.setex(
@@ -343,6 +352,20 @@ async def ask_question(request: AskRequest):
                 )
 
         return result
+
+    except OutputGuardrailError as exc:
+        logger.error(
+            "Generated answer failed output validation: %s",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The AI provider returned an answer "
+                "that failed validation."
+            ),
+        ) from exc
 
     except AIServiceError as exc:
         logger.exception("OpenRouter answer generation failed.")
